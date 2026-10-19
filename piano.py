@@ -108,7 +108,12 @@ UMBRAL_MOV_REL = 0.03            # umbral relativo (fracción de la altura). ~3%
 COOLDOWN = 0.18                  # segundos entre retriggers por dedo
 last_play = {i: 0 for i in range(10)}
 
+# Variable para mostrar la última nota tocada en pantalla
+ultima_nota_tocada = ""
+tiempo_ultima_nota = 0
+
 def tocar_sonido_idx(idx):
+    global ultima_nota_tocada, tiempo_ultima_nota
     if idx not in sonidos:
         return
     ahora = time.time()
@@ -117,6 +122,9 @@ def tocar_sonido_idx(idx):
     try:
         sonidos[idx].play()
         last_play[idx] = ahora
+        # Guardamos la nota para mostrarla
+        ultima_nota_tocada = nota_por_dedo[idx]
+        tiempo_ultima_nota = ahora
     except Exception as e:
         print("Error reproduciendo sonido:", e)
 
@@ -124,31 +132,20 @@ def tocar_sonido_idx(idx):
 # UTIL: obtener puntas en orden consistente usando handedness
 # --------------------------
 def obtener_tips_ordenados(results, frame_width, frame_height):
-    """
-    Retorna lista de 10 tuples (x_px, y_px, y_norm) en el orden:
-    meñique izq -> ... -> pulgar izq -> pulgar der -> ... -> meñique der.
-    Si una mano no está presente, sus 5 entradas serán (None, None, None).
-
-    IMPORTANTE: emparejamos multi_hand_landmarks con multi_handedness
-    usando zip como dicta la API de MediaPipe.
-    """
     salida = []
 
     if not results.multi_hand_landmarks:
         return [(None, None, None)] * 10
 
-    # Asegurar que tenemos handedness y landmarks emparejados
-    # La API garantiza que multi_hand_landmarks[i] corresponde a multi_handedness[i]
     hands_by_label = {}
     if results.multi_hand_landmarks and results.multi_handedness:
         for lm, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
-            label = handedness.classification[0].label  # 'Left' o 'Right' (respecto a la persona)
+            label = handedness.classification[0].label
             hands_by_label[label] = lm
 
-    # Mano izquierda: queremos meñique->...->pulgar (reversed tips)
     if 'Left' in hands_by_label:
         lm = hands_by_label['Left']
-        for tip in reversed(FINGER_TIPS):  # pinky -> thumb
+        for tip in reversed(FINGER_TIPS):
             x = int(lm.landmark[tip].x * frame_width)
             y = int(lm.landmark[tip].y * frame_height)
             y_norm = lm.landmark[tip].y
@@ -156,7 +153,6 @@ def obtener_tips_ordenados(results, frame_width, frame_height):
     else:
         salida.extend([(None, None, None)] * 5)
 
-    # Mano derecha: thumb->...->pinky
     if 'Right' in hands_by_label:
         lm = hands_by_label['Right']
         for tip in FINGER_TIPS:
@@ -167,9 +163,7 @@ def obtener_tips_ordenados(results, frame_width, frame_height):
     else:
         salida.extend([(None, None, None)] * 5)
 
-    # seguridad: devolver exactamente 10 entradas
     if len(salida) != 10:
-        # completar con None si algo extraño sucedió
         salida = (salida + [(None, None, None)] * 10)[:10]
     return salida
 
@@ -184,63 +178,90 @@ if not cap.isOpened():
 print("\n🎹 Piano activado — usando SOLO puntas y landmarks de ambas manos correctamente emparejados")
 print("Mueve las puntas de tus dedos hacia abajo para tocar.\n")
 
-# Nota sobre flip horizontal:
-# - En este script flippeamos el frame antes de procesar, por lo que la handedness
-#   devuelta por MediaPipe corresponde a la imagen que ves en pantalla.
-# - Si prefieres procesar sin flip y sólo voltear para mostrar, mueve el cv2.flip
-#   después del procesamiento. Ambas opciones son válidas, solo cambia la referencia visual.
-
 while True:
     ret, frame = cap.read()
     if not ret:
         print("Error leyendo frame.")
         break
 
-    # Volteamos horizontalmente para comportamiento "espejo" (opcional).
-    # Esto también cambiará lo que ve Mediapipe, pero la API devuelve handedness
-    # consistente con la imagen procesada.
     frame = cv2.flip(frame, 1)
-
     h, w, _ = frame.shape
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = hands.process(rgb)
 
-    # Si no hay detecciones, resetear historial para evitar retriggers
+    # --- MEJORA 1: Contador de manos ---
+    num_manos = len(results.multi_hand_landmarks) if results.multi_hand_landmarks else 0
+    
+    # Dibujamos un fondo semi-transparente para que el texto se lea mejor
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, 180), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
+
+    # Mostramos el número de manos (siempre visible)
+    cv2.putText(frame, f"Manos detectadas: {num_manos}", (10, 30), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+    # --- MEJORA 2: Guía de Jingle Bells ---
+    cv2.putText(frame, "Guia Jingle Bells (Mano Derecha):", (10, 65), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+    cv2.putText(frame, "E E E | E E E | E G C D E | F F F F", (10, 95), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
+    # Si no hay detecciones, mostramos el frame con el texto y reseteamos
     if not results.multi_hand_landmarks:
         prev_y = [None] * 10
+        
+        # --- MEJORA 3: Mostrar última nota tocada (si fue hace menos de 2 segundos) ---
+        if time.time() - tiempo_ultima_nota < 2.0 and ultima_nota_tocada:
+            cv2.putText(frame, f"Nota: {ultima_nota_tocada}", (w - 200, 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
+
         cv2.imshow("Piano - puntas (pygame) - ambas manos", frame)
         if cv2.waitKey(1) & 0xFF == 27:
             break
         continue
 
-    tips = obtener_tips_ordenados(results, w, h)  # lista de 10 (x,y,y_norm)
+    # --- NUEVA MEJORA: Dibujar el esqueleto de las manos ---
+    for hand_landmarks in results.multi_hand_landmarks:
+        mp_draw.draw_landmarks(
+            frame, 
+            hand_landmarks, 
+            mp_hands.HAND_CONNECTIONS,
+            mp_draw.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2), # Puntos verdes
+            mp_draw.DrawingSpec(color=(255, 255, 255), thickness=2, circle_radius=2) # Líneas blancas
+        )
 
-    # Procesar solo usando las puntas (y_norm), con suavizado EMA
+    tips = obtener_tips_ordenados(results, w, h)
+
     for i in range(10):
         x_px, y_px, y_norm = tips[i]
         if y_norm is None:
             prev_y[i] = None
             continue
 
-        # aplicar suavizado EMA
         if prev_y[i] is None:
             y_smooth = y_norm
         else:
             y_smooth = alpha_smooth * y_norm + (1 - alpha_smooth) * prev_y[i]
 
-        # Dibujar punto en pixel (opcional)
-        cv2.circle(frame, (x_px, int(y_px)), 6, (255, 0, 0), -1)
+        # (El círculo azul original está comentado para dejar que el esqueleto se vea mejor)
+        # cv2.circle(frame, (x_px, int(y_px)), 6, (255, 0, 0), -1)
 
-        # calcular desplazamiento en coordenadas normalizadas (positivo hacia abajo)
         if prev_y[i] is not None:
             dy_norm = y_smooth - prev_y[i]
             if dy_norm > UMBRAL_MOV_REL:
                 tocar_sonido_idx(i)
                 nota = nota_por_dedo[i]
+                # Texto flotante sobre el dedo
                 cv2.putText(frame, nota, (x_px - 10, int(y_px) - 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
         prev_y[i] = y_smooth
+
+    # --- MEJORA 3 (continuación): Mostrar última nota tocada en grande ---
+    if time.time() - tiempo_ultima_nota < 2.0 and ultima_nota_tocada:
+        cv2.putText(frame, f"Nota: {ultima_nota_tocada}", (w - 200, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
 
     cv2.imshow("Piano - puntas (pygame) - ambas manos", frame)
     if cv2.waitKey(1) & 0xFF == 27:
